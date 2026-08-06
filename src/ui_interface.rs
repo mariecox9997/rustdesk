@@ -352,9 +352,17 @@ pub fn get_options() -> String {
     serde_json::to_string(&m).unwrap_or_default()
 }
 
-#[inline]
 pub fn test_if_valid_server(host: String, test_with_proxy: bool) -> String {
-    hbb_common::socket_client::test_if_valid_server(&host, test_with_proxy)
+    let error = hbb_common::socket_client::test_if_valid_server(&host, test_with_proxy);
+    if !error.is_empty()
+        && !host.contains(':')
+        && hbb_common::is_domain_port_str(&format!("{host}:0"))
+    {
+        // A TXT/SRV-only domain does not need an A/AAAA record to be valid.
+        String::new()
+    } else {
+        error
+    }
 }
 
 #[inline]
@@ -1563,6 +1571,8 @@ async fn check_id(
     id: String,
     uuid: Bytes,
 ) -> &'static str {
+    let rendezvous_server =
+        crate::resolve_rustdesk_server(&rendezvous_server, RENDEZVOUS_PORT).await;
     if let Ok(mut socket) = hbb_common::socket_client::connect_tcp(
         crate::check_port(rendezvous_server, RENDEZVOUS_PORT),
         CONNECT_TIMEOUT,

@@ -13,7 +13,8 @@ use hbb_common::{
     allow_err,
     anyhow::{self, bail},
     config::{
-        self, keys::*, option2bool, use_ws, Config, CONNECT_TIMEOUT, REG_INTERVAL, RENDEZVOUS_PORT,
+        self, keys::*, option2bool, use_ws, Config, CONNECT_TIMEOUT, REG_INTERVAL, RELAY_PORT,
+        RENDEZVOUS_PORT,
     },
     futures::future::join_all,
     log,
@@ -101,6 +102,7 @@ pub(crate) fn reset_needs_deploy_notification() {
 #[derive(Clone)]
 pub struct RendezvousMediator {
     addr: TargetAddr<'static>,
+    configured_host: String,
     host: String,
     host_prefix: String,
     keep_alive: i32,
@@ -212,11 +214,13 @@ impl RendezvousMediator {
     }
 
     pub async fn start_udp(server: ServerPtr, host: String) -> ResultType<()> {
-        let host = check_port(&host, RENDEZVOUS_PORT);
+        let configured_host = host;
+        let host = crate::resolve_rustdesk_server(&configured_host, RENDEZVOUS_PORT).await;
         log::info!("start udp: {host}");
         let (mut socket, mut addr) = new_udp_for(&host, CONNECT_TIMEOUT).await?;
         let mut rz = Self {
             addr: addr.clone(),
+            configured_host,
             host: host.clone(),
             host_prefix: Self::get_host_prefix(&host),
             keep_alive: crate::DEFAULT_KEEP_ALIVE,
@@ -310,6 +314,13 @@ impl RendezvousMediator {
                                 if last_dns_check.elapsed().as_millis() as i64 > DNS_INTERVAL {
                                     // in some case of network reconnect (dial IP network),
                                     // old UDP socket not work any more after network recover
+                                    if let Some(host) =
+                                        crate::common::resolve_rustdesk_dns(&rz.configured_host)
+                                            .await
+                                    {
+                                        rz.host_prefix = Self::get_host_prefix(&host);
+                                        rz.host = host;
+                                    }
                                     if let Some((s, new_addr)) = socket_client::rebind_udp_for(&rz.host).await? {
                                         socket = s;
                                         rz.addr = new_addr.clone();
@@ -421,13 +432,15 @@ impl RendezvousMediator {
     }
 
     pub async fn start_tcp(server: ServerPtr, host: String) -> ResultType<()> {
-        let host = check_port(&host, RENDEZVOUS_PORT);
+        let configured_host = host;
+        let host = crate::resolve_rustdesk_server(&configured_host, RENDEZVOUS_PORT).await;
         log::info!("start tcp: {}", hbb_common::websocket::check_ws(&host));
         let mut conn = connect_tcp(host.clone(), CONNECT_TIMEOUT).await?;
         let key = crate::get_key(true).await;
         crate::secure_tcp(&mut conn, &key).await?;
         let mut rz = Self {
             addr: conn.local_addr().into_target_addr()?,
+            configured_host,
             host: host.clone(),
             host_prefix: Self::get_host_prefix(&host),
             keep_alive: crate::DEFAULT_KEEP_ALIVE,
@@ -529,6 +542,7 @@ impl RendezvousMediator {
         socket_addr_v6: bytes::Bytes,
         meta: ConnectionMeta,
     ) -> ResultType<()> {
+        let relay_server = crate::resolve_rustdesk_server(&relay_server, RELAY_PORT).await;
         let peer_addr = AddrMangle::decode(&socket_addr);
         log::info!(
             "create_relay requested from {:?}, relay_server: {}, uuid: {}, secure: {}",
@@ -576,7 +590,7 @@ impl RendezvousMediator {
             return Ok(());
         }
         let peer_addr_v6 = hbb_common::AddrMangle::decode(&fla.socket_addr_v6);
-        let relay_server = self.get_relay_server(fla.relay_server.clone());
+        let relay_server = self.get_relay_server(fla.relay_server.clone()).await;
         let relay = use_ws() || Config::is_proxy();
         let mut socket_addr_v6 = Default::default();
         let meta = connection_meta(
@@ -666,7 +680,7 @@ impl RendezvousMediator {
             socket_addr_v6 =
                 start_ipv6(peer_addr_v6, peer_addr, server.clone(), meta.clone()).await;
         }
-        let relay_server = self.get_relay_server(ph.relay_server);
+        let relay_server = self.get_relay_server(ph.relay_server).await;
         // for ensure, websocket go relay directly
         if ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC)
             || Config::get_nat_type() == NatType::SYMMETRIC as i32
@@ -822,7 +836,7 @@ impl RendezvousMediator {
         Ok(())
     }
 
-    fn get_relay_server(&self, provided_by_rendezvous_server: String) -> String {
+    async fn get_relay_server(&self, provided_by_rendezvous_server: String) -> String {
         let mut relay_server = Config::get_option("relay-server");
         if relay_server.is_empty() {
             relay_server = provided_by_rendezvous_server;
@@ -830,7 +844,7 @@ impl RendezvousMediator {
         if relay_server.is_empty() {
             relay_server = crate::increase_port(&self.host, 1);
         }
-        relay_server
+        crate::resolve_rustdesk_server(&relay_server, RELAY_PORT).await
     }
 }
 
