@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 env:
-  RUST_VERSION: "1.75"
+  RUST_VERSION: "1.82"
   LLVM_VERSION: "15.0.6"
   FLUTTER_VERSION: "3.24.5"
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
