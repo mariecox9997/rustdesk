@@ -912,6 +912,7 @@ impl Client {
         conn_type: ConnType,
         ipv4: bool,
     ) -> ResultType<Stream> {
+        let relay_server = crate::resolve_rustdesk_server(&relay_server, RELAY_PORT).await;
         let mut conn = connect_tcp(
             ipv4_to_ipv6(check_port(relay_server, RELAY_PORT), ipv4),
             CONNECT_TIMEOUT,

@@ -62,6 +62,8 @@ pub const PLATFORM_ANDROID: &str = "Android";
 
 pub const TIMER_OUT: Duration = Duration::from_secs(1);
 pub const DEFAULT_KEEP_ALIVE: i32 = 60_000;
+const RUSTDESK_SRV_SERVICE: &str = "_rustdesk._tcp";
+const RUSTDESK_DNS_TIMEOUT: u64 = 3_000;
 
 const MIN_VER_MULTI_UI_SESSION: &str = "1.2.4";
 
@@ -626,7 +628,7 @@ pub fn test_nat_type() {
 async fn test_nat_type_() -> ResultType<bool> {
     log::info!("Testing nat ...");
     let start = std::time::Instant::now();
-    let server1 = Config::get_rendezvous_server();
+    let server1 = resolve_configured_rendezvous_server().await;
     let server2 = crate::increase_port(&server1, -1);
     let mut msg_out = RendezvousMessage::new();
     let serial = Config::get_serial();
@@ -694,10 +696,20 @@ pub async fn get_rendezvous_server(ms_timeout: u64) -> (String, Vec<String>, boo
             a = lic.host;
         }
     }
-    let mut b: Vec<String> = b
-        .drain(..)
-        .map(|x| socket_client::check_port(x, config::RENDEZVOUS_PORT))
-        .collect();
+    let mut resolved_selected = None;
+    let mut resolved_servers = Vec::with_capacity(b.len());
+    for server in b.drain(..) {
+        let selected = socket_client::check_port(&server, config::RENDEZVOUS_PORT) == a;
+        let server = resolve_rustdesk_server(&server, config::RENDEZVOUS_PORT).await;
+        if selected {
+            resolved_selected = Some(server.clone());
+        }
+        resolved_servers.push(server);
+    }
+    let mut b = resolved_servers;
+    if let Some(server) = resolved_selected {
+        a = server;
+    }
     let c = if b.contains(&a) {
         b = b.drain(..).filter(|x| x != &a).collect();
         true
@@ -746,12 +758,10 @@ async fn test_rendezvous_server_() {
     for host in servers {
         futs.push(tokio::spawn(async move {
             let tm = std::time::Instant::now();
-            if socket_client::connect_tcp(
-                crate::check_port(&host, RENDEZVOUS_PORT),
-                CONNECT_TIMEOUT,
-            )
-            .await
-            .is_ok()
+            let server = resolve_rustdesk_server(&host, RENDEZVOUS_PORT).await;
+            if socket_client::connect_tcp(server, CONNECT_TIMEOUT)
+                .await
+                .is_ok()
             {
                 let elapsed = tm.elapsed().as_micros();
                 Config::update_latency(&host, elapsed as _);
@@ -908,6 +918,131 @@ pub fn check_port<T: std::string::ToString>(host: T, port: i32) -> String {
 #[inline]
 pub fn increase_port<T: std::string::ToString>(host: T, offset: i32) -> String {
     hbb_common::socket_client::increase_port(host, offset)
+}
+
+/// Resolves `_rustdesk._tcp.<server>` SRV or `<server>` TXT records when no port
+/// was explicitly configured. TXT records must contain an `IP:port` value.
+/// TXT takes precedence over SRV. Existing IP addresses and `host:port` values
+/// keep their current behavior.
+pub async fn resolve_rustdesk_server(server: &str, default_port: i32) -> String {
+    resolve_rustdesk_dns(server)
+        .await
+        .unwrap_or_else(|| check_port(server, default_port))
+}
+
+pub(crate) async fn resolve_rustdesk_dns(server: &str) -> Option<String> {
+    let query = rustdesk_srv_query(server)?;
+
+    use hickory_resolver::TokioAsyncResolver;
+
+    let resolver = match TokioAsyncResolver::tokio_from_system_conf() {
+        Ok(resolver) => resolver,
+        Err(err) => {
+            log::debug!("Failed to load the system DNS configuration: {err}");
+            return None;
+        }
+    };
+    let (srv, txt) = tokio::join!(
+        lookup_rustdesk_srv(&resolver, query, server),
+        lookup_rustdesk_txt(&resolver, server)
+    );
+    txt.or(srv)
+}
+
+async fn lookup_rustdesk_srv(
+    resolver: &hickory_resolver::TokioAsyncResolver,
+    query: String,
+    server: &str,
+) -> Option<String> {
+    let lookup = timeout(RUSTDESK_DNS_TIMEOUT, resolver.srv_lookup(query))
+        .await
+        .ok()?
+        .ok()?;
+    let min_priority = lookup.iter().map(|record| record.priority()).min()?;
+    let records: Vec<_> = lookup
+        .iter()
+        .filter(|record| record.priority() == min_priority && record.port() > 0)
+        .collect();
+    if records.is_empty() {
+        return None;
+    }
+
+    let total_weight: u32 = records.iter().map(|record| record.weight() as u32).sum();
+    let selected = if total_weight == 0 {
+        &records[hbb_common::rand::random::<usize>() % records.len()]
+    } else {
+        let mut choice = hbb_common::rand::random::<u32>() % total_weight;
+        records.iter().find(|record| {
+            let weight = record.weight() as u32;
+            if choice < weight {
+                true
+            } else {
+                choice -= weight;
+                false
+            }
+        })?
+    };
+    let target = selected.target().to_utf8();
+    let target = target.trim_end_matches('.');
+    if target.is_empty() {
+        return None;
+    }
+    let resolved = check_port(target, selected.port() as i32);
+    log::info!("Resolved RustDesk SRV {server} to {resolved}");
+    Some(resolved)
+}
+
+async fn lookup_rustdesk_txt(
+    resolver: &hickory_resolver::TokioAsyncResolver,
+    server: &str,
+) -> Option<String> {
+    let query = server.trim_end_matches('.');
+    let lookup = timeout(RUSTDESK_DNS_TIMEOUT, resolver.txt_lookup(query))
+        .await
+        .ok()?
+        .ok()?;
+    for record in lookup.iter() {
+        let value: Vec<u8> = record
+            .txt_data()
+            .iter()
+            .flat_map(|part| part.iter().copied())
+            .collect();
+        if let Some(resolved) = parse_rustdesk_txt(&value) {
+            log::info!("Resolved RustDesk TXT {server} to {resolved}");
+            return Some(resolved);
+        }
+    }
+    None
+}
+
+fn parse_rustdesk_txt(value: &[u8]) -> Option<String> {
+    let value = std::str::from_utf8(value).ok()?.trim();
+    let address = value.parse::<SocketAddr>().ok()?;
+    if address.port() == 0 {
+        return None;
+    }
+    Some(address.to_string())
+}
+
+fn rustdesk_srv_query(server: &str) -> Option<String> {
+    if server.is_empty() || server.contains(':') || hbb_common::is_ipv4_str(server) {
+        return None;
+    }
+    let server = server.trim_end_matches('.');
+    if server.is_empty() || server.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(format!("{RUSTDESK_SRV_SERVICE}.{server}"))
+}
+
+async fn resolve_configured_rendezvous_server() -> String {
+    let selected = check_port(Config::get_rendezvous_server(), RENDEZVOUS_PORT);
+    for server in Config::get_rendezvous_servers() {
+        if check_port(&server, RENDEZVOUS_PORT) == selected {
+            return resolve_rustdesk_server(&server, RENDEZVOUS_PORT).await;
+        }
+    }
+    selected
 }
 
 pub const POSTFIX_SERVICE: &'static str = "_service";
@@ -1180,8 +1315,8 @@ fn tcp_proxy_log_target(url: &str) -> String {
 }
 
 #[inline]
-fn get_tcp_proxy_addr() -> String {
-    check_port(Config::get_rendezvous_server(), RENDEZVOUS_PORT)
+async fn get_tcp_proxy_addr() -> String {
+    resolve_configured_rendezvous_server().await
 }
 
 /// Send an HTTP request via the rendezvous server's TCP proxy using protobuf.
@@ -1197,7 +1332,7 @@ async fn tcp_proxy_request(
     body: &[u8],
     headers: Vec<HeaderEntry>,
 ) -> ResultType<HttpProxyResponse> {
-    let tcp_addr = get_tcp_proxy_addr();
+    let tcp_addr = get_tcp_proxy_addr().await;
     if tcp_addr.is_empty() {
         bail!("No rendezvous server configured for TCP proxy");
     }
@@ -2906,8 +3041,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_get_tcp_proxy_addr_normalizes_bare_ipv6_host() {
+    #[tokio::test]
+    async fn test_get_tcp_proxy_addr_normalizes_bare_ipv6_host() {
         struct RestoreCustomRendezvousServer(String);
 
         impl Drop for RestoreCustomRendezvousServer {
@@ -2927,7 +3062,46 @@ mod tests {
             "1:2".to_string(),
         );
 
-        assert_eq!(get_tcp_proxy_addr(), format!("[1:2]:{RENDEZVOUS_PORT}"));
+        assert_eq!(
+            get_tcp_proxy_addr().await,
+            format!("[1:2]:{RENDEZVOUS_PORT}")
+        );
+    }
+
+    #[test]
+    fn test_rustdesk_srv_query_only_accepts_hosts_without_ports() {
+        assert_eq!(
+            rustdesk_srv_query("example.com"),
+            Some("_rustdesk._tcp.example.com".to_owned())
+        );
+        assert_eq!(
+            rustdesk_srv_query("example.com."),
+            Some("_rustdesk._tcp.example.com".to_owned())
+        );
+        assert_eq!(rustdesk_srv_query("example.com:21116"), None);
+        assert_eq!(rustdesk_srv_query("192.0.2.1"), None);
+        assert_eq!(rustdesk_srv_query("2001:db8::1"), None);
+        assert_eq!(rustdesk_srv_query("ws://example.com"), None);
+    }
+
+    #[test]
+    fn test_parse_rustdesk_txt_accepts_ip_and_port() {
+        assert_eq!(
+            parse_rustdesk_txt(b"203.0.113.1:32116"),
+            Some("203.0.113.1:32116".to_owned())
+        );
+        assert_eq!(
+            parse_rustdesk_txt(b" [2001:db8::1]:32117 "),
+            Some("[2001:db8::1]:32117".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_parse_rustdesk_txt_rejects_invalid_values() {
+        assert_eq!(parse_rustdesk_txt(b"example.com:32116"), None);
+        assert_eq!(parse_rustdesk_txt(b"203.0.113.1"), None);
+        assert_eq!(parse_rustdesk_txt(b"203.0.113.1:0"), None);
+        assert_eq!(parse_rustdesk_txt(&[0xff]), None);
     }
 
     #[tokio::test]
